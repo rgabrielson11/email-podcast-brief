@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import base64, json, logging, os, hashlib
+import base64, hmac, html, json, logging, os, hashlib
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
@@ -19,6 +19,11 @@ AUDIO_OUT_DIR  = Path(os.environ["AUDIO_OUT_DIR"]) if os.environ.get("AUDIO_OUT_
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [HTTP] %(message)s")
 log = logging.getLogger(__name__)
 
+# ── Constant-time string compare ─────────────────────────────────────────────
+def safe_eq(a: str, b: str) -> bool:
+    """Constant-time string comparison to avoid timing side-channels on secrets."""
+    return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+
 # ── Basic Auth ─────────────────────────────────────────────────────────────
 def check_basic_auth(headers) -> bool:
     if not FEED_PASSWORD:
@@ -29,7 +34,7 @@ def check_basic_auth(headers) -> bool:
     try:
         decoded = base64.b64decode(auth[6:]).decode("utf-8")
         user, _, pw = decoded.partition(":")
-        return user == FEED_USER and pw == FEED_PASSWORD
+        return safe_eq(user, FEED_USER) and safe_eq(pw, FEED_PASSWORD)
     except Exception:
         return False
 
@@ -80,6 +85,20 @@ def delete_episode(uid_hash: str) -> bool:
     save_state(state)
     log.info(f"Removed episode: {ep['subject']}")
     return True
+
+# ── Path safety ────────────────────────────────────────────────────────────
+def resolve_audio_file(requested_name: str) -> Path | None:
+    """Resolve a requested /audio/<name> path against the allowed audio
+    directories, rejecting any attempt to escape them via '..' or symlinks."""
+    for base in (AUDIO_OUT_DIR, DATA_DIR / "audio"):
+        try:
+            base_resolved = base.resolve()
+            candidate = (base_resolved / requested_name).resolve()
+        except (OSError, ValueError):
+            continue
+        if candidate.is_relative_to(base_resolved) and candidate.suffix == ".mp3" and candidate.is_file():
+            return candidate
+    return None
 
 # ── HTML ───────────────────────────────────────────────────────────────────
 STYLE = """
@@ -144,7 +163,7 @@ def render_player(admin: bool, flash: str = "", flash_ok: bool = False) -> bytes
     else:
         right += '<a class="btn btn-ghost" href="/login">Manage</a>'
 
-    flash_html = f'<div class="flash{"  ok" if flash_ok else ""}">{flash}</div>' if flash else ""
+    flash_html = f'<div class="flash{"  ok" if flash_ok else ""}">{html.escape(flash)}</div>' if flash else ""
 
     ep_html = ""
     for ep in episodes:
@@ -167,7 +186,7 @@ def render_player(admin: bool, flash: str = "", flash_ok: bool = False) -> bytes
           <div class="ep-top">
             <div class="ep-info">
               <div class="ep-meta">{date_str} &nbsp;·&nbsp; {size_mb} MB</div>
-              <div class="ep-title">{ep['subject']}</div>
+              <div class="ep-title">{html.escape(ep['subject'])}</div>
             </div>{delete_btn}
           </div>
           <audio controls preload="none">
@@ -218,7 +237,7 @@ def render_player(admin: bool, flash: str = "", flash_ok: bool = False) -> bytes
     return page(body)
 
 def render_login(error: str = "") -> bytes:
-    err_html = f'<div class="flash">{error}</div>' if error else ""
+    err_html = f'<div class="flash">{html.escape(error)}</div>' if error else ""
     if FEED_PASSWORD and FEED_BASE_URL:
         sub_url = FEED_BASE_URL.replace("://", f"://{FEED_USER}:{FEED_PASSWORD}@") + "/feed.xml"
     else:
@@ -326,8 +345,8 @@ class PodcastHandler(BaseHTTPRequestHandler):
             else:
                 self.send_response(404); self.end_headers()
         elif path.startswith("/audio/"):
-            f = DATA_DIR / path.lstrip("/")
-            if f.exists() and f.suffix == ".mp3":
+            f = resolve_audio_file(path[len("/audio/"):])
+            if f:
                 self.send_file(f, "audio/mpeg")
             else:
                 self.send_response(404); self.end_headers()
@@ -346,7 +365,7 @@ class PodcastHandler(BaseHTTPRequestHandler):
 
         if path == "/login":
             pw = params.get("password", [""])[0]
-            if pw == ADMIN_PASSWORD:
+            if safe_eq(pw, ADMIN_PASSWORD):
                 token = make_token(pw + os.urandom(16).hex())
                 _sessions.add(token)
                 self.send_response(302)
